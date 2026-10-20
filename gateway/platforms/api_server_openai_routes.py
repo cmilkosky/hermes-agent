@@ -667,7 +667,8 @@ class OpenAICompatRoutesMixin:
                 system_prompt = content if system_prompt is None else system_prompt + "\n" + content
             elif role in {"user", "assistant"}:
                 try:
-                    content = _normalize_multimodal_content(raw_content)
+                    content = _normalize_multimodal_content(
+                        raw_content, allow_tiling=role == "user" and idx == len(messages) - 1)
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
                 conversation_messages.append({"role": role, "content": content})
@@ -1075,7 +1076,10 @@ class OpenAICompatRoutesMixin:
                     continue
                 elif isinstance(item, dict):
                     try:
-                        content = _normalize_multimodal_content(item.get("content", ""))
+                        content = _normalize_multimodal_content(
+                            item.get("content", ""),
+                            allow_tiling=item.get("role", "user") == "user" and idx == len(raw_input) - 1,
+                        )
                     except ValueError as exc:
                         return _multimodal_validation_error(exc, param=f"input[{idx}].content")
                     input_messages.append({"role": item.get("role", "user"), "content": content})

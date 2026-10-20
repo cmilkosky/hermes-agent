@@ -343,6 +343,91 @@ class TestLargeImageHandling:
         missing = tmp_path / "does_not_exist.png"
         assert _ir._file_to_data_url(missing) is None
 
+    def test_native_guard_limits_are_loaded_from_vision_config(self):
+        from agent import image_routing as _ir
+        from hermes_cli.config import atomic_config_write, get_config_path
+
+        atomic_config_write(get_config_path(), {"vision": {
+            "native_input_max_dimension": 2048,
+            "native_input_target_bytes": 1024 * 1024,
+        }})
+
+        assert _ir._native_input_guard_limits() == (2048, 1024 * 1024)
+
+    def test_configured_native_guard_caps_decode_dimensions(self, tmp_path: Path):
+        import pytest
+
+        Image = pytest.importorskip("PIL.Image")
+        from agent import image_routing as _ir
+
+        img = tmp_path / "large.jpg"
+        Image.new("RGB", (5712, 4284), (100, 120, 140)).save(img, format="JPEG", quality=95)
+        with patch.object(_ir, "_native_input_guard_limits", return_value=(2048, 1024 * 1024)):
+            url = _ir._file_to_data_url(img)
+
+        assert url is not None
+        assert len(url) <= 1024 * 1024
+        decoded = base64.b64decode(url.split(",", 1)[1])
+        with Image.open(__import__("io").BytesIO(decoded)) as guarded:
+            assert max(guarded.size) <= 2048
+
+    def test_high_detail_tiling_makes_four_overlapping_png_tiles(self):
+        import io
+        import pytest
+
+        Image = pytest.importorskip("PIL.Image")
+        from agent import image_routing as _ir
+
+        source = Image.new("RGB", (3840, 2160), "white")
+        buf = io.BytesIO()
+        source.save(buf, format="PNG")
+        url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        with patch.object(_ir, "_native_input_tiling_enabled", return_value=True), \
+             patch.object(_ir, "_native_input_guard_limits", return_value=(2048, 2 * 1024 * 1024)):
+            parts = _ir.prepare_native_image_parts(url)
+
+        assert len(parts) == 5
+        assert "four overlapping tiles" in parts[0]["text"]
+        assert [part["type"] for part in parts[1:]] == ["image_url"] * 4
+        for part in parts[1:]:
+            tile_url = part["image_url"]["url"]
+            assert tile_url.startswith("data:image/png;base64,")
+            decoded = base64.b64decode(tile_url.split(",", 1)[1])
+            with Image.open(io.BytesIO(decoded)) as tile:
+                assert max(tile.size) <= 2048
+
+    def test_tiling_leaves_small_image_as_one_part(self):
+        import pytest
+
+        Image = pytest.importorskip("PIL.Image")
+        from agent import image_routing as _ir
+
+        buf = __import__("io").BytesIO()
+        Image.new("RGB", (1200, 800), "white").save(buf, format="PNG")
+        url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        with patch.object(_ir, "_native_input_tiling_enabled", return_value=True), \
+             patch.object(_ir, "_native_input_guard_limits", return_value=(2048, 2 * 1024 * 1024)):
+            parts = _ir.prepare_native_image_parts(url)
+        assert len(parts) == 1
+
+    def test_multiple_large_files_stay_one_guarded_part_each(self, tmp_path: Path):
+        import pytest
+
+        Image = pytest.importorskip("PIL.Image")
+        from agent import image_routing as _ir
+
+        paths = []
+        for name in ("one.png", "two.png"):
+            path = tmp_path / name
+            Image.new("RGB", (3000, 2200), "white").save(path, format="PNG")
+            paths.append(str(path))
+        with patch.object(_ir, "_native_input_tiling_enabled", return_value=True), \
+             patch.object(_ir, "_native_input_guard_limits", return_value=(2048, 2 * 1024 * 1024)):
+            parts, skipped = build_native_content_parts("compare", paths)
+        assert not skipped
+        assert len([part for part in parts if part["type"] == "image_url"]) == 2
+        assert all("four overlapping tiles" not in part.get("text", "") for part in parts)
+
 
 
 # ─── extract_image_refs ──────────────────────────────────────────────────────

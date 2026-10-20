@@ -43,6 +43,49 @@ class TestNormalizeMultimodalContent:
         content = [{"type": "input_text", "text": "hello"}]
         assert _normalize_multimodal_content(content) == "hello"
 
+    def test_inline_data_image_passes_through_native_guard(self):
+        original = "data:image/jpeg;base64,b3JpZ2luYWw="
+        guarded = "data:image/jpeg;base64,Z3VhcmRlZA=="
+        content = [{"type": "image_url", "image_url": {"url": original}}]
+
+        guarded_parts = [{"type": "image_url", "image_url": {"url": guarded}}]
+        with patch(
+            "gateway.platforms.api_server.prepare_native_image_parts", return_value=guarded_parts
+        ) as guard:
+            normalized = _normalize_multimodal_content(content)
+
+        guard.assert_called_once_with(original, detail=None, allow_tiling=False)
+        assert normalized == [{"type": "image_url", "image_url": {"url": guarded}}]
+
+    def test_live_single_image_can_expand_to_tiled_parts(self):
+        original = "data:image/png;base64,b3JpZ2luYWw="
+        expanded = [
+            {"type": "text", "text": "[High-detail image split into four overlapping tiles]"},
+            *[
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{idx}"}}
+                for idx in range(4)
+            ],
+        ]
+        content = [{"type": "image_url", "image_url": {"url": original}}]
+        with patch(
+            "gateway.platforms.api_server.prepare_native_image_parts", return_value=expanded
+        ) as prepare:
+            normalized = _normalize_multimodal_content(content, allow_tiling=True)
+        prepare.assert_called_once_with(original, detail=None, allow_tiling=True)
+        assert normalized == expanded
+
+    def test_multiple_images_disable_tiling(self):
+        content = [
+            {"type": "image_url", "image_url": {"url": "https://example.com/one.png"}},
+            {"type": "image_url", "image_url": {"url": "https://example.com/two.png"}},
+        ]
+        with patch(
+            "gateway.platforms.api_server.prepare_native_image_parts",
+            side_effect=lambda url, **_: [{"type": "image_url", "image_url": {"url": url}}],
+        ) as prepare:
+            _normalize_multimodal_content(content, allow_tiling=True)
+        assert all(call.kwargs["allow_tiling"] is False for call in prepare.call_args_list)
+
 
 class TestContentHasVisiblePayload:
 
@@ -150,4 +193,3 @@ class TestResponsesMultimodalHTTP:
                 {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
             ]
             assert mock_run.captured["user_message"] == expected
-

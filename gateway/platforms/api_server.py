@@ -145,6 +145,7 @@ from gateway.platforms.base import (
     validate_media_delivery_path)
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from agent.i18n import t
+from agent.image_routing import prepare_native_image_parts
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
@@ -461,16 +462,12 @@ def _normalize_chat_content(content: Any, *, _max_depth: int = 10, _depth: int =
         return ""
 
 
-# Chat Completions / Responses part-type spellings; emitted shape is always the canonical
-# ``{"type": "text", ...}`` / ``{"type": "image_url", ...}`` the agent pipeline understands.
+# Chat Completions / Responses spellings; output uses canonical ``text`` / ``image_url`` parts.
 _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
 _FILE_PART_TYPES = frozenset({"file", "input_file"})
-
-
-def _normalize_image_part(part: dict[str, Any]) -> dict[str, Any]:
-    """Validate one image part (Responses top-level ``image_url`` string or Chat Completions
-    ``{"url", "detail"}`` dict) into the canonical vision shape; raises ValueError."""
+def _normalize_image_part(part: dict[str, Any], *, allow_tiling: bool = False) -> list[dict[str, Any]]:
+    """Normalize one Responses/Chat Completions image part to canonical vision shape."""
     detail = part.get("detail")
     image_ref = part.get("image_url")
     if isinstance(image_ref, dict):
@@ -490,15 +487,12 @@ def _normalize_image_part(part: dict[str, Any]) -> dict[str, Any]:
     elif not (lowered.startswith("http://") or lowered.startswith("https://")):
         raise ValueError(
             "invalid_image_url:Image inputs must use http(s) URLs or data:image/... URLs.")
-    image_part: dict[str, Any] = {"type": "image_url", "image_url": {"url": url_value}}
     if detail is not None:
         if not isinstance(detail, str) or not detail.strip():
             raise ValueError("invalid_content_part:Image detail must be a non-empty string when provided.")
-        image_part["image_url"]["detail"] = detail.strip()
-    return image_part
-
-
-def _normalize_multimodal_content(content: Any) -> Any:
+        detail = detail.strip()
+    return prepare_native_image_parts(url_value, detail=detail, allow_tiling=allow_tiling)
+def _normalize_multimodal_content(content: Any, *, allow_tiling: bool = False) -> Any:
     """Validate multimodal content: a plain string when text-only, else canonical ``text`` /
     ``image_url`` parts (native OpenAI vision shape; Anthropic conversion happens downstream).
 
@@ -512,6 +506,8 @@ def _normalize_multimodal_content(content: Any) -> Any:
     if not isinstance(content, list):
         return _normalize_chat_content(content)
     normalized_parts: list[dict[str, Any]] = []
+    image_count = sum(isinstance(part, dict) and str(part.get("type") or "").strip().lower()
+                      in _IMAGE_PART_TYPES for part in content)
     for part in _cap_list(content):
         if isinstance(part, str):
             if part:
@@ -526,7 +522,8 @@ def _normalize_multimodal_content(content: Any) -> Any:
             if text is not None and str(text):
                 normalized_parts.append({"type": "text", "text": _cap_text(str(text))})
         elif part_type in _IMAGE_PART_TYPES:
-            normalized_parts.append(_normalize_image_part(part))
+            normalized_parts.extend(_normalize_image_part(
+                part, allow_tiling=allow_tiling and image_count == 1))
         elif part_type in _FILE_PART_TYPES:
             raise ValueError(
                 "unsupported_content_type:Inline image inputs are supported, "
@@ -639,7 +636,7 @@ def _session_chat_user_message(body: dict[str, Any], *, param: str = "message") 
     if not _content_has_visible_payload(user_message):
         return None, _error_response("Missing 'message' field", 400, code="missing_message")
     try:
-        return _normalize_multimodal_content(user_message), None
+        return _normalize_multimodal_content(user_message, allow_tiling=True), None
     except ValueError as exc:
         return None, _multimodal_validation_error(exc, param=param)
 

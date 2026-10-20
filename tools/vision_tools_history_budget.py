@@ -143,16 +143,37 @@ def release_embed(image_url: str) -> None:
 # ``[Image attached: <url>]`` handle per image into the text part; ``conversation_loop.run_conversation``
 # scopes those handles here for the turn and the tool inherits them through contextvars.
 _NATIVE_HANDLE_RE = re.compile(r"^\[Image attached(?: at)?: (.+?)\]\s*$", re.MULTILINE)
-_native_turn_images: ContextVar[frozenset[str]] = ContextVar("vision_native_turn_images", default=frozenset())
+_OPAQUE_ATTACHMENT_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+_TILED_NATIVE_MARKER = "[High-detail image split into four overlapping tiles"
+_native_turn_images: ContextVar[tuple[frozenset[str], int, bool]] = ContextVar(
+    "vision_native_turn_images", default=(frozenset(), 0, False)
+)
 
 
-def _native_turn_keys(user_message: Any) -> frozenset[str]:
-    if not isinstance(user_message, list) or not any(
-        isinstance(p, dict) and p.get("type") == "image_url" for p in user_message
-    ):
-        return frozenset()
+def _native_turn_keys(user_message: Any) -> tuple[frozenset[str], int, bool]:
+    if not isinstance(user_message, list):
+        return frozenset(), 0, False
+    image_parts = [
+        p for p in user_message
+        if isinstance(p, dict) and p.get("type") == "image_url"
+    ]
+    if not image_parts:
+        return frozenset(), 0, False
     text = "\n".join(p.get("text", "") for p in user_message if isinstance(p, dict) and p.get("type") == "text")
-    return frozenset(_image_key(m.strip()) for m in _NATIVE_HANDLE_RE.findall(text) if m.strip())
+    refs = [m.strip() for m in _NATIVE_HANDLE_RE.findall(text) if m.strip()]
+    refs.extend(
+        str((part.get("image_url") or {}).get("url") or "").strip()
+        for part in image_parts
+        if isinstance(part.get("image_url"), dict)
+    )
+    return (
+        frozenset(_image_key(ref) for ref in refs if ref),
+        len(image_parts),
+        _TILED_NATIVE_MARKER in text,
+    )
 
 
 @contextlib.contextmanager
@@ -169,7 +190,11 @@ def native_turn_duplicate(image_url: str, region: Optional[list]) -> Optional[st
     """Text tool result when ``image_url`` already rides the active user turn natively, else
     ``None``. A native re-embed would put the identical pixels into the same request twice
     (the Telegram case in #76411); a ``region`` crop still embeds because it returns new detail."""
-    if region is not None or _image_key(image_url) not in _native_turn_images.get():
+    active_keys, image_count, is_tiled = _native_turn_images.get()
+    exact_match = _image_key(image_url) in active_keys
+    opaque_single_attachment = (image_count == 1 or is_tiled and image_count == 4) and bool(
+        _OPAQUE_ATTACHMENT_ID_RE.fullmatch(image_url.strip()))
+    if region is not None or not (exact_match or opaque_single_attachment):
         return None
     return json.dumps({
         "success": True,

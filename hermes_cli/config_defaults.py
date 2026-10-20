@@ -1246,11 +1246,11 @@ DEFAULT_CONFIG = {
         # instead of going to the agent. [] disables.
         "stop_phrases": ["stop"],
     },
-    # Native vision embeds (vision_analyze / browser screenshots on vision-capable main models) ride
-    # conversation history and are re-sent on every later API call.
+    # Native vision inputs and history embeds for vision-capable main models.
     "vision": {
-        # Byte budget for one embedded image (clamped 64 KiB..4 MiB). Raise it for dense phone
-        # screenshots of tables the model calls "unreadable" at 256 KB.
+        # Optional preflight long-edge/data-URL caps for user attachments; zero preserves native bytes.
+        "native_input_max_dimension": 0, "native_input_target_bytes": 0, "native_input_tiling": False,
+        # History-embed byte budget (64 KiB..4 MiB); raise for dense screenshots unreadable at 256 KB.
         "embed_target_bytes": 256 * 1024,
         # How often vision_analyze may embed the SAME image (region crops included) per session.
         # null = 3 inside delegated subagents (they run unattended), unlimited for the main agent;

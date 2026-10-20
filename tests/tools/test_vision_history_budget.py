@@ -154,6 +154,43 @@ class TestNativeTurnDedupe:
             assert _embedded(_load(same, region=[0, 0, 8, 8]))
             assert _embedded(_load(other))
 
+    def test_single_api_attachment_dedupes_opaque_openwebui_file_id(self):
+        parts = [
+            {"type": "text", "text": "describe this"},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,YQ=="}},
+        ]
+        opaque_id = "23d4f8e2-b762-4d18-8bde-4a530c2ba07b"
+
+        with budget.native_turn_images(parts):
+            result = budget.native_turn_duplicate(opaque_id, region=None)
+
+        assert result is not None
+        assert json.loads(result)["already_in_context"] is True
+
+    def test_opaque_id_fallback_requires_exactly_one_attachment(self):
+        parts = [
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,YQ=="}},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,Yg=="}},
+        ]
+        with budget.native_turn_images(parts):
+            assert budget.native_turn_duplicate(
+                "23d4f8e2-b762-4d18-8bde-4a530c2ba07b", region=None
+            ) is None
+
+    def test_tiled_api_attachment_dedupes_opaque_openwebui_file_id(self):
+        parts = [
+            {"type": "text", "text": "[High-detail image split into four overlapping tiles]"},
+            *[
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{idx}"}}
+                for idx in range(4)
+            ],
+        ]
+        opaque_id = "23d4f8e2-b762-4d18-8bde-4a530c2ba07b"
+        with budget.native_turn_images(parts):
+            result = budget.native_turn_duplicate(opaque_id, region=None)
+        assert result is not None
+        assert json.loads(result)["already_in_context"] is True
+
     def test_run_conversation_scopes_the_turn_for_the_tool_loop(self, tmp_path, monkeypatch):
         """Production wiring: ``run_conversation`` with a native-parts user message; the model
         calls ``vision_analyze`` on the attached path from the tool loop and gets the text

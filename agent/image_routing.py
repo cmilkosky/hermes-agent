@@ -12,6 +12,7 @@ main models (``native`` is the absolute override); else ``supports_vision``
 from __future__ import annotations
 
 import base64
+import binascii
 import logging
 import mimetypes
 import os
@@ -25,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 
 _VALID_MODES = frozenset({"auto", "native", "text"})
+_TILED_NATIVE_MARKER = (
+    "[High-detail image split into four overlapping tiles in reading order: "
+    "top-left, top-right, bottom-left, bottom-right. Treat them as one image.]"
+)
 
 
 # Extensions extract_image_refs() auto-attaches. Documents/archives are excluded:
@@ -391,10 +396,10 @@ def decide_image_input_mode(
     return "native" if _lookup_supports_vision(provider, model, cfg, **extra) is True else "text"
 
 
-# Image size handling is REACTIVE: attach at full size and let
-# ``run_agent._try_shrink_image_parts_in_messages`` shrink + retry on rejection
-# (e.g. Anthropic's 5 MB ceiling as HTTP 400). Provider ceilings are partial and
-# evolving; a proactive table would go stale and silently degrade quality.
+# Image size handling is reactive by default: attach at full size and let
+# ``run_agent._try_shrink_image_parts_in_messages`` shrink + retry on rejection.
+# Resource-constrained local runtimes may opt into the provider-independent
+# ``vision.native_input_*`` guard below so a dangerous decode never reaches them.
 
 # Magic-byte signatures as ((offset, bytes), ...) conjunctions, checked in order.
 # Platforms lie about content-type (Discord serves PNG as ``image/webp`` for
@@ -498,7 +503,228 @@ def _accepted_mimes() -> frozenset:
     return _UNIVERSALLY_SUPPORTED_MIMES
 
 
-def _file_to_data_url(path: Path) -> Optional[str]:
+def _native_input_guard_limits() -> tuple[int, int]:
+    """Configured ``(max_dimension, target_data_url_bytes)``; zero disables a limit."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        cfg = load_config()
+        raw_dimension = cfg_get(cfg, "vision", "native_input_max_dimension", default=0)
+        raw_bytes = cfg_get(cfg, "vision", "native_input_target_bytes", default=0)
+    except Exception:
+        logger.debug("image_routing: could not resolve native input guard config", exc_info=True)
+        return 0, 0
+
+    def _limit(raw: Any, *, minimum: int, maximum: int) -> int:
+        try:
+            if isinstance(raw, bool):
+                return 0
+            value = int(raw or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return min(max(value, minimum), maximum) if value > 0 else 0
+
+    return (
+        _limit(raw_dimension, minimum=256, maximum=8192),
+        _limit(raw_bytes, minimum=64 * 1024, maximum=20 * 1024 * 1024),
+    )
+
+
+def _native_input_tiling_enabled() -> bool:
+    """Whether one oversized live user image may expand into a 2x2 tile set."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        raw = cfg_get(load_config(), "vision", "native_input_tiling", default=False)
+    except Exception:
+        logger.debug("image_routing: could not resolve native input tiling config", exc_info=True)
+        return False
+    if isinstance(raw, bool):
+        return raw
+    return _BOOL_TOKENS.get(raw.strip().lower(), False) if isinstance(raw, str) else raw == 1
+
+
+def _guard_native_image_bytes(raw: bytes, mime: str, *, label: str) -> tuple[bytes, str]:
+    """Proactively bound a native image for memory-constrained inference servers.
+
+    The guard is opt-in through ``vision.native_input_max_dimension`` and
+    ``vision.native_input_target_bytes``.  It is deliberately provider-independent:
+    the goal is to cap decode-time pixels and request size before the first attempt,
+    while the existing retry shrinker remains the fallback for provider rejections.
+    """
+    max_dimension, target_bytes = _native_input_guard_limits()
+    if not max_dimension and not target_bytes:
+        return raw, mime
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        logger.warning("image_routing: native input guard is enabled but Pillow is unavailable")
+        return raw, mime
+    try:
+        with Image.open(BytesIO(raw)) as opened:
+            opened.seek(0)
+            image = ImageOps.exif_transpose(opened).copy()
+    except (OSError, SyntaxError, ValueError) as exc:
+        logger.warning("image_routing: native input guard could not decode %s -- %s", label, exc)
+        return raw, mime
+
+    original_size = (image.width, image.height)
+    estimated_url_bytes = ((len(raw) + 2) // 3) * 4 + len(mime) + 13
+    dimensions_ok = not max_dimension or max(original_size) <= max_dimension
+    bytes_ok = not target_bytes or estimated_url_bytes <= target_bytes
+    if dimensions_ok and bytes_ok:
+        return raw, mime
+
+    if max_dimension and max(image.width, image.height) > max_dimension:
+        resampling = getattr(Image, "Resampling", Image)
+        image.thumbnail((max_dimension, max_dimension), resampling.LANCZOS)
+
+    has_alpha = image.mode in {"RGBA", "LA"} or (
+        image.mode == "P" and "transparency" in image.info
+    )
+    if has_alpha or mime == "image/png":
+        if has_alpha and image.mode not in {"RGBA", "LA"}:
+            image = image.convert("RGBA")
+        elif not has_alpha and image.mode not in {"RGB", "L"}:
+            image = image.convert("RGB")
+        output_format, output_mime, qualities = "PNG", "image/png", (None,)
+    else:
+        if image.mode not in {"RGB", "L"}:
+            image = image.convert("RGB")
+        output_format, output_mime, qualities = "JPEG", "image/jpeg", (88, 78, 68, 58)
+
+    best: Optional[bytes] = None
+    resampling = getattr(Image, "Resampling", Image)
+    for attempt in range(8):
+        for quality in qualities:
+            buf = BytesIO()
+            save_options = {"optimize": True}
+            if quality is not None:
+                save_options["quality"] = quality
+            image.save(buf, format=output_format, **save_options)
+            candidate = buf.getvalue()
+            if best is None or len(candidate) < len(best):
+                best = candidate
+            candidate_url_bytes = ((len(candidate) + 2) // 3) * 4 + len(output_mime) + 13
+            if not target_bytes or candidate_url_bytes <= target_bytes:
+                logger.info(
+                    "image_routing: guarded %s from %dx%d/%d bytes to %dx%d/%d bytes",
+                    label, original_size[0], original_size[1], len(raw),
+                    image.width, image.height, len(candidate),
+                )
+                return candidate, output_mime
+        if min(image.width, image.height) <= 256:
+            break
+        image = image.resize(
+            (max(int(image.width * 0.8), 256), max(int(image.height * 0.8), 256)),
+            resampling.LANCZOS,
+        )
+
+    if best is None:
+        return raw, mime
+    logger.warning(
+        "image_routing: guarded %s to %dx%d/%d bytes but could not reach target %d",
+        label, image.width, image.height, len(best), target_bytes,
+    )
+    return best, output_mime
+
+
+def guard_native_image_url(url: str) -> str:
+    """Apply the native-input guard to an inline ``data:image`` URL."""
+    if not isinstance(url, str) or not url.lower().startswith("data:image/"):
+        return url
+    header, separator, payload = url.partition(",")
+    if not separator or ";base64" not in header.lower():
+        return url
+    mime = header[5:].split(";", 1)[0].lower()
+    try:
+        raw = base64.b64decode(payload, validate=True)
+    except (ValueError, binascii.Error):
+        return url
+    guarded, guarded_mime = _guard_native_image_bytes(raw, mime, label="inline native image")
+    if guarded is raw and guarded_mime == mime:
+        return url
+    return f"data:{guarded_mime};base64,{base64.b64encode(guarded).decode('ascii')}"
+
+
+def _canonical_image_part(url: str, detail: Optional[str] = None) -> dict[str, Any]:
+    part: dict[str, Any] = {"type": "image_url", "image_url": {"url": url}}
+    if detail is not None:
+        part["image_url"]["detail"] = detail
+    return part
+
+
+def _encoded_image_url(image: Any, mime: str, *, label: str) -> str:
+    """Encode one Pillow image, then apply the ordinary per-image guard."""
+    output_mime = "image/png" if mime == "image/png" else "image/jpeg"
+    output_format = "PNG" if output_mime == "image/png" else "JPEG"
+    if output_mime == "image/png":
+        if image.mode not in {"RGB", "RGBA", "L", "LA"}:
+            image = image.convert("RGB")
+    elif image.mode not in {"RGB", "L"}:
+        image = image.convert("RGB")
+    buf = BytesIO()
+    options = {"optimize": True} if output_format == "PNG" else {"quality": 92, "optimize": True}
+    image.save(buf, format=output_format, **options)
+    guarded, guarded_mime = _guard_native_image_bytes(buf.getvalue(), output_mime, label=label)
+    payload = base64.b64encode(guarded).decode("ascii")
+    return f"data:{guarded_mime};base64,{payload}"
+
+
+def prepare_native_image_parts(
+    url: str,
+    *,
+    detail: Optional[str] = None,
+    allow_tiling: bool = True,
+) -> list[dict[str, Any]]:
+    """Guard one image URL, or split one oversized inline image into four tiles.
+
+    Tiling is opt-in, applies only to the live turn selected by the caller, and
+    only expands a single source image.  The 8% overlap across each centre seam
+    keeps labels and UI elements from being cut at a tile boundary.
+    """
+    if not isinstance(url, str) or not url.lower().startswith("data:image/"):
+        return [_canonical_image_part(url, detail)]
+    header, separator, payload = url.partition(",")
+    if not separator or ";base64" not in header.lower():
+        return [_canonical_image_part(guard_native_image_url(url), detail)]
+    mime = header[5:].split(";", 1)[0].lower()
+    if not allow_tiling or not _native_input_tiling_enabled() or mime not in {
+        "image/jpeg", "image/png", "image/webp",
+    }:
+        return [_canonical_image_part(guard_native_image_url(url), detail)]
+    try:
+        raw = base64.b64decode(payload, validate=True)
+        from PIL import Image, ImageOps
+
+        with Image.open(BytesIO(raw)) as opened:
+            opened.seek(0)
+            image = ImageOps.exif_transpose(opened).copy()
+    except (ImportError, OSError, SyntaxError, ValueError, binascii.Error):
+        return [_canonical_image_part(guard_native_image_url(url), detail)]
+    max_dimension, _ = _native_input_guard_limits()
+    if not max_dimension or max(image.size) <= max_dimension:
+        return [_canonical_image_part(guard_native_image_url(url), detail)]
+
+    width, height = image.size
+    x_mid, y_mid = width // 2, height // 2
+    x_pad, y_pad = max(round(width * 0.04), 1), max(round(height * 0.04), 1)
+    boxes = (
+        (0, 0, min(x_mid + x_pad, width), min(y_mid + y_pad, height)),
+        (max(x_mid - x_pad, 0), 0, width, min(y_mid + y_pad, height)),
+        (0, max(y_mid - y_pad, 0), min(x_mid + x_pad, width), height),
+        (max(x_mid - x_pad, 0), max(y_mid - y_pad, 0), width, height),
+    )
+    labels = ("top-left", "top-right", "bottom-left", "bottom-right")
+    parts = [{"type": "text", "text": _TILED_NATIVE_MARKER}]
+    for box, label in zip(boxes, labels):
+        tile_url = _encoded_image_url(image.crop(box), mime, label=f"high-detail {label} tile")
+        parts.append(_canonical_image_part(tile_url, detail))
+    logger.info("image_routing: split %dx%d native image into four overlapping tiles", width, height)
+    return parts
+
+
+def _file_to_data_url(path: Path, *, apply_guard: bool = True) -> Optional[str]:
     """Encode a local image as a base64 data URL at native size (the agent retry
     loop shrinks on rejection, so lenient providers pay no silent quality tax);
     MIMEs outside the accepted set are transcoded to PNG. None when unreadable,
@@ -527,6 +753,8 @@ def _file_to_data_url(path: Path) -> Optional[str]:
             return None
         logger.info("image_routing: transcoded %s (%s) -> image/png for provider compatibility", path.name, mime)
         raw, mime = transcoded, "image/png"
+    if apply_guard:
+        raw, mime = _guard_native_image_bytes(raw, mime, label=str(path))
     return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
 
 
@@ -548,7 +776,7 @@ def build_native_content_parts(
     attached: list[tuple[str, str]] = []  # (url, hint)
     for raw_path in image_paths:
         p = Path(raw_path)
-        data_url = _file_to_data_url(p) if p.exists() and p.is_file() else None
+        data_url = _file_to_data_url(p, apply_guard=False) if p.exists() and p.is_file() else None
         if data_url:
             attached.append((data_url, f"[Image attached at: {raw_path}]"))
         else:
@@ -559,8 +787,17 @@ def build_native_content_parts(
     if not attached:
         return ([{"type": "text", "text": text}] if text else []), skipped
     combined_text = f"{text or 'What do you see in this image?'}\n\n" + "\n".join(h for _, h in attached)
-    image_parts = [{"type": "image_url", "image_url": {"url": u}} for u, _ in attached]
+    image_parts = [
+        part for url, _ in attached
+        for part in prepare_native_image_parts(url, allow_tiling=len(attached) == 1)
+    ]
     return [{"type": "text", "text": combined_text}, *image_parts], skipped
 
 
-__all__ = ["build_native_content_parts", "decide_image_input_mode", "extract_image_refs"]
+__all__ = [
+    "build_native_content_parts",
+    "decide_image_input_mode",
+    "extract_image_refs",
+    "guard_native_image_url",
+    "prepare_native_image_parts",
+]
