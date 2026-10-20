@@ -26,6 +26,7 @@ except ImportError:
 
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
+from gateway.platforms import api_server_vision_admission as _vision_admission
 
 
 logger = logging.getLogger("gateway.platforms.api_server")
@@ -963,8 +964,9 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 interim_assistant_callback=_interim_cb, **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
-        result, usage, served_runtime = await _submit_api_worker(
-            loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
+        result, usage, served_runtime = await _vision_admission.submit_api_worker(
+            loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server),
+            run.user_message, _submit_api_worker)
         # Publish request metrics (daily counters + latency) with each completed run (#52323).
         self._record_api_metrics(usage, time.perf_counter() - _run_started_at)
         if not isinstance(result, dict):

@@ -13,6 +13,7 @@ import random
 import pytest
 
 from agent.delegation_context import delegated_child_context
+from agent.image_routing import TILED_NATIVE_MARKER
 from hermes_cli.config import get_config_path
 from tools import vision_tools_history_budget as budget
 from tools.vision_tools import _vision_analyze_native
@@ -179,7 +180,7 @@ class TestNativeTurnDedupe:
 
     def test_tiled_api_attachment_dedupes_opaque_openwebui_file_id(self):
         parts = [
-            {"type": "text", "text": "[High-detail image split into four overlapping tiles]"},
+            {"type": "text", "text": TILED_NATIVE_MARKER},
             *[
                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{idx}"}}
                 for idx in range(4)

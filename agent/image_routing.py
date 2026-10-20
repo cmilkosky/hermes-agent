@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 _VALID_MODES = frozenset({"auto", "native", "text"})
-_TILED_NATIVE_MARKER = (
+TILED_NATIVE_MARKER = (
     "[High-detail image split into four overlapping tiles in reading order: "
     "top-left, top-right, bottom-left, bottom-right. Treat them as one image.]"
 )
@@ -716,7 +716,7 @@ def prepare_native_image_parts(
         (max(x_mid - x_pad, 0), max(y_mid - y_pad, 0), width, height),
     )
     labels = ("top-left", "top-right", "bottom-left", "bottom-right")
-    parts = [{"type": "text", "text": _TILED_NATIVE_MARKER}]
+    parts = [{"type": "text", "text": TILED_NATIVE_MARKER}]
     for box, label in zip(boxes, labels):
         tile_url = _encoded_image_url(image.crop(box), mime, label=f"high-detail {label} tile")
         parts.append(_canonical_image_part(tile_url, detail))
@@ -795,6 +795,7 @@ def build_native_content_parts(
 
 
 __all__ = [
+    "TILED_NATIVE_MARKER",
     "build_native_content_parts",
     "decide_image_input_mode",
     "extract_image_refs",

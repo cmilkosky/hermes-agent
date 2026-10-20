@@ -18,6 +18,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from agent.image_routing import TILED_NATIVE_MARKER
 from tools.registry import tool_error
 
 # 256 KB keeps a 1568px screenshot cheap enough to ride the session (#92699); the clamp keeps one
@@ -147,7 +148,6 @@ _OPAQUE_ATTACHMENT_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
-_TILED_NATIVE_MARKER = "[High-detail image split into four overlapping tiles"
 _native_turn_images: ContextVar[tuple[frozenset[str], int, bool]] = ContextVar(
     "vision_native_turn_images", default=(frozenset(), 0, False)
 )
@@ -172,7 +172,7 @@ def _native_turn_keys(user_message: Any) -> tuple[frozenset[str], int, bool]:
     return (
         frozenset(_image_key(ref) for ref in refs if ref),
         len(image_parts),
-        _TILED_NATIVE_MARKER in text,
+        TILED_NATIVE_MARKER in text,
     )
 
 

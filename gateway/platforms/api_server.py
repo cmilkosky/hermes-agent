@@ -137,7 +137,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.display_config import resolve_display_setting
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
-from gateway.platforms import api_server_runs as _api_runs
+from gateway.platforms import api_server_runs as _api_runs, api_server_vision_admission as _vision_admission
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
 from gateway.platforms.base import (
@@ -4342,7 +4342,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         try:
 # Worker-scoped count rides along so the shutdown close gate still sees the thread
             # after this handler task is cancelled (#116535); released in the worker's finally.
-            result, usage = await _api_runs._submit_api_worker(loop, _run)
+            result, usage = await _vision_admission.submit_api_worker(loop, _run, user_message, _api_runs._submit_api_worker)
             return result, usage
         finally:
             self._inflight_agent_runs -= 1
