@@ -56,7 +56,7 @@ def _spawn(tmp_path, subcommand, *, sudo_ok: bool, targeted_only: bool = False, 
         "hermes_cli.web_server.PROJECT_ROOT", tmp_path
     ):
         web_server_gateway._spawn_hermes_action(subcommand, "probe")
-    return popen.call_args.args[0]
+    return popen.call_args.args[0], popen.call_args.kwargs["env"]
 
 
 @pytest.mark.parametrize(
@@ -76,8 +76,10 @@ def test_only_system_scope_lifecycle_verbs_are_spawned_under_sudo(
         user_unit.parent.mkdir(parents=True)
         user_unit.write_text("[Service]\n", encoding="utf-8")
     monkeypatch.setattr("hermes_cli.web_server_profiles._resolve_profile_dir", lambda name: tmp_path / name)
-    argv = _spawn(tmp_path, subcommand, sudo_ok=True)
-    plain = runtime_command(tmp_path, subcommand)
+    argv, child_env = _spawn(tmp_path, subcommand, sudo_ok=True)
+    # Elevated launchers pin the resolved home before bootstrap because sudo drops HERMES_HOME.
+    pinned_home = child_env.get("HERMES_HOME") if elevated else None
+    plain = runtime_command(tmp_path, subcommand, home=pinned_home)
     assert argv == (["sudo", "-n", *plain] if elevated else plain)
 
 
@@ -91,7 +93,9 @@ def test_targeted_nopasswd_sudoers_still_elevates(unprivileged, system_scope_ins
     # Same posture as the ``hermes update`` fleet restart: a refused blanket ``sudo -n true`` is
     # inconclusive; the exact argv is then checked non-destructively (``sudo -n -l -- <argv>``).
     probes: list = []
-    argv = _spawn(tmp_path, ["gateway", "restart"], sudo_ok=True, targeted_only=True, probes=probes)
-    plain = runtime_command(tmp_path, ["gateway", "restart"])
+    argv, child_env = _spawn(
+        tmp_path, ["gateway", "restart"], sudo_ok=True, targeted_only=True, probes=probes)
+    plain = runtime_command(
+        tmp_path, ["gateway", "restart"], home=child_env["HERMES_HOME"])
     assert argv == ["sudo", "-n", *plain]
     assert probes == [["sudo", "-n", "true"], ["sudo", "-n", "-l", "--", *plain]]

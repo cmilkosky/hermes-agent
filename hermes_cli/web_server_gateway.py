@@ -491,8 +491,17 @@ def _spawn_hermes_action(
         _atomic_bytes(_ACTION_LOG_DIR / f"{name}.action_id", action_id.encode("ascii"))
 
     from hermes_cli._launchers import runtime_command
-    cmd = runtime_command(PROJECT_ROOT, subcommand)
-    if _action_targets_system_gateway(subcommand):
+    # Build the child environment before its command: an elevated system action crosses sudo's
+    # env_reset boundary, so HERMES_HOME must also be pinned in the inline launcher *before*
+    # hermes_bootstrap imports the selected dependency generation. Relying on the environment
+    # here makes the root child look under /root/.hermes and fail on dependencies such as ruamel.
+    action_env = _profile_action_environment(subcommand, env_overrides)
+    targets_system_gateway = _action_targets_system_gateway(subcommand)
+    cmd = runtime_command(
+        PROJECT_ROOT, subcommand,
+        home=action_env.get("HERMES_HOME") if targets_system_gateway else None,
+    )
+    if targets_system_gateway:
         # A system-scope lifecycle verb spawned as the dashboard's own user can only ever write
         # "System gateway <verb> requires root" into this log, so the button never worked on a
         # system install (#110820). Elevate — the CLI is sudo-aware: it adopts the unit's
@@ -513,9 +522,6 @@ def _spawn_hermes_action(
             log_file.close()
             raise RuntimeError(message)
         cmd = ["sudo", "-n", *cmd]
-    # Named-profile actions get a scrubbed, pinned environment so the child cannot inherit the
-    # dashboard profile's credentials; see _profile_action_environment (also drops _HERMES_GATEWAY).
-    action_env = _profile_action_environment(subcommand, env_overrides)
     detach = {"creationflags": windows_detach_flags()} if sys.platform == "win32" else {"start_new_session": True}
     proc = subprocess.Popen(
         cmd, cwd=str(PROJECT_ROOT), stdin=subprocess.DEVNULL, stdout=log_file, stderr=subprocess.STDOUT,
