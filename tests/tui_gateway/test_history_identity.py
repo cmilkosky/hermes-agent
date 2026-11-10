@@ -1,5 +1,5 @@
 """Repeated content cannot stand in for persisted transcript identity."""
-from tui_gateway.server import _reconcile_display_with_live
+from tui_gateway.server import _dedupe_message_uids, _reconcile_display_with_live
 
 
 def test_repeated_answer_keeps_later_unflushed_turn_by_row_identity():
@@ -26,3 +26,22 @@ def test_live_only_row_before_the_boundary_keeps_the_unflushed_tail():
     assert _reconcile_display_with_live(persisted, injected) == persisted + tail
     expanded = [{'role': 'user', 'content': 'continue\n[expanded @file body]'}, persisted[1], *tail]
     assert _reconcile_display_with_live(persisted, expanded) == persisted + tail
+
+
+def test_compacted_archive_copy_with_same_message_uid_renders_once():
+    original = {"role": "assistant", "content": "answer", "message_uid": "msg-1", "_row_id": 10}
+    archived = {"role": "assistant", "content": "answer", "message_uid": "msg-1", "_row_id": 99}
+
+    assert _dedupe_message_uids([original, archived]) == [original]
+    assert _reconcile_display_with_live([original, archived], [original]) == [original]
+
+
+def test_equal_text_with_distinct_or_missing_uids_remains_distinct():
+    messages = [
+        {"role": "user", "content": "again", "message_uid": "msg-1"},
+        {"role": "user", "content": "again", "message_uid": "msg-2"},
+        {"role": "user", "content": "again"},
+        {"role": "user", "content": "again"},
+    ]
+
+    assert _dedupe_message_uids(messages) == messages

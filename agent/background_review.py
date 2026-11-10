@@ -225,6 +225,37 @@ def _review_input_token_budget(
     return budget if budget > 0 else None
 
 
+def _review_request_within_input_budget(
+    review_agent: Any, conversation_history: list[dict], user_message: str,
+) -> bool:
+    """Refuse an oversized review before its first provider request.
+
+    The aggregate loop budget only has real usage after request one returns.  A
+    routed auxiliary model with a smaller context window can therefore reject
+    the initial replay before that gate has a chance to run.  This conservative
+    estimate intentionally includes the review instruction; provider-owned
+    system/tool overhead only makes an at-budget request less safe.
+    """
+    budget = getattr(review_agent, "_review_input_token_budget", None)
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
+        return True
+
+    from agent.model_metadata import estimate_messages_tokens_rough
+
+    estimated = estimate_messages_tokens_rough(
+        [*conversation_history, {"role": "user", "content": user_message}]
+    )
+    if estimated < budget:
+        return True
+    logger.warning(
+        "Skipping background review before its first provider request: "
+        "estimated input %s tokens meets or exceeds the %s-token budget",
+        estimated,
+        budget,
+    )
+    return False
+
+
 def load_background_review_settings() -> tuple[bool, dict[str, Any]]:
     """Single config read -> ``(enabled, task_cfg)``. Fail-open (``enabled=True``) so a broken
     config never silently disables reviews — but WARN so the cost is visible."""
@@ -1223,14 +1254,17 @@ def _run_review_fork(
     try:
         if review_run is None or review_run.begin_request(st.review_agent):
             # Routed -> digest (cache cold anyway); same model -> full snapshot (warm cache reads).
-            st.review_agent.run_conversation(
-                user_message=(
-                    prompt + "\n\nYou can only call " + memory_phrase_prompt +
-                    "management tools. Other tools will be denied "
-                    "at runtime — do not attempt them." + prompt_extra
-                ),
-                conversation_history=_digest_history(messages_snapshot) if _routed else messages_snapshot,
+            review_history = _digest_history(messages_snapshot) if _routed else messages_snapshot
+            review_prompt = (
+                prompt + "\n\nYou can only call " + memory_phrase_prompt +
+                "management tools. Other tools will be denied "
+                "at runtime — do not attempt them." + prompt_extra
             )
+            if _review_request_within_input_budget(st.review_agent, review_history, review_prompt):
+                st.review_agent.run_conversation(
+                    user_message=review_prompt,
+                    conversation_history=review_history,
+                )
     finally:
         clear_thread_tool_whitelist()
         # Attribute usage to the PARENT session. Snapshot BEFORE unregister/close so counters

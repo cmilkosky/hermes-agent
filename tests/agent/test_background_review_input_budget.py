@@ -257,3 +257,34 @@ def test_background_review_config_does_not_freeze_a_fixed_input_budget():
     from hermes_cli.config_defaults import DEFAULT_CONFIG
 
     assert "max_input_tokens" not in DEFAULT_CONFIG["auxiliary"]["background_review"]
+
+
+def test_review_preflight_refuses_first_request_at_or_over_budget():
+    """An oversized initial replay never reaches the provider-side tool loop."""
+    from agent.background_review import _review_request_within_input_budget
+
+    review_agent = SimpleNamespace(_review_input_token_budget=6_000)
+    with patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=6_000) as estimate:
+        assert _review_request_within_input_budget(
+            review_agent,
+            [{"role": "user", "content": "large history"}],
+            "review instructions",
+        ) is False
+
+    estimate.assert_called_once_with([
+        {"role": "user", "content": "large history"},
+        {"role": "user", "content": "review instructions"},
+    ])
+
+
+def test_review_preflight_allows_request_below_budget_and_unbounded_forks():
+    from agent.background_review import _review_request_within_input_budget
+
+    with patch("agent.model_metadata.estimate_messages_tokens_rough", return_value=5_999):
+        assert _review_request_within_input_budget(
+            SimpleNamespace(_review_input_token_budget=6_000), [], "review"
+        ) is True
+
+    with patch("agent.model_metadata.estimate_messages_tokens_rough") as estimate:
+        assert _review_request_within_input_budget(SimpleNamespace(), [], "review") is True
+        estimate.assert_not_called()

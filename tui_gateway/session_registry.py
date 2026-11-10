@@ -730,6 +730,29 @@ def _durable_ids(msg) -> set:
     return ids | ({("row", row_id)} if isinstance(row_id, int) and not isinstance(row_id, bool) else set())
 
 
+def _dedupe_message_uids(messages: list[dict]) -> list[dict]:
+    """Collapse storage/archive copies of one logical message for display.
+
+    Compaction deliberately preserves archived rows, and the display projection
+    deliberately reads them.  Some failed/retried compactions can leave an
+    active row and a compacted archive row with the same ``message_uid``.  They
+    are one logical message and must render once.  Identity-free legacy rows and
+    equal text with different UIDs remain distinct.
+    """
+    from agent.message_metadata import MESSAGE_UID
+
+    seen: set[str] = set()
+    result: list[dict] = []
+    for message in messages:
+        uid = message.get(MESSAGE_UID) if isinstance(message, dict) else None
+        if isinstance(uid, str) and uid:
+            if uid in seen:
+                continue
+            seen.add(uid)
+        result.append(message)
+    return result
+
+
 def _legacy_display_anchor(display: list[dict], memory: list[dict]) -> int:
     """Align an identity-free model prefix without consuming later repeated turns."""
     prefix = [(msg.get('role'), _coerce_message_text(msg.get('content'))) for msg in display]
@@ -754,6 +777,8 @@ def _reconcile_display_with_live(db_display: list[dict], in_memory: list[dict]) 
     warm switch AND a not-yet-flushed live turn is kept. The anchor is the row's durable identity: matching on
     ``(role, text)`` picked the LAST equal text, so a repeated message ("ok" again) hid the unflushed turn.
     Identity-free projections align their ordered prefix; conflicting durable IDs never match by text."""
+    db_display = _dedupe_message_uids(db_display)
+    in_memory = _dedupe_message_uids(in_memory)
     if not db_display:
         return in_memory
     if not in_memory:
@@ -767,7 +792,7 @@ def _reconcile_display_with_live(db_display: list[dict], in_memory: list[dict]) 
         last_shared = _legacy_display_anchor(db_display, in_memory)
     if last_shared == -1:
         return db_display  # DB tail not in memory (DB ahead, or diverged) — trust it over duplicating
-    return list(db_display) + list(in_memory[last_shared + 1 :])
+    return _dedupe_message_uids(list(db_display) + list(in_memory[last_shared + 1 :]))
 
 
 def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> list[dict]:
